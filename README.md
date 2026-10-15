@@ -50,7 +50,7 @@ Googleドライブに置いた会議の録音から、**文字起こし**と**�
 
 1. **Googleアカウント**（Colab と Googleドライブ）
 2. **Claude APIキー**（要約に使用。[Anthropic Console](https://console.anthropic.com/) で作成）
-   - 費用の目安：1時間の会議で数十円程度（Opus使用時。実行後に概算額を表示します）
+   - 費用の目安：1時間の会議で100円前後（Opus使用時の概算。実行後に実際の目安額を表示します）
    - Haikuモデルを選ぶとさらに安くなります
 
 ## 使い方
