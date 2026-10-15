@@ -356,6 +356,16 @@ def generate(system, user_text, max_new_tokens, show=False):
     new_tokens = out[0][inputs["input_ids"].shape[1]:]
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    # AIが同じ行を何度も繰り返してしまった場合は、2回目以降を取り除く
+    seen, lines = set(), []
+    for line in text.split("\n"):
+        key = line.strip().lstrip("-*0123456789. ")
+        if len(key) >= 8 and not key.startswith(("#", "|")):
+            if key in seen:
+                continue
+            seen.add(key)
+        lines.append(line)
+    text = "\n".join(lines)
     if len(new_tokens) >= max_new_tokens:
         text += "\n\n（※長くなったため、ここで途切れています）"
     return text
