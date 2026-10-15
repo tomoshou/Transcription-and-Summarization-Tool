@@ -38,16 +38,13 @@ Googleドライブに置いた会議の録音（数時間の長さでもOK）か
 2. **議事録**（要約・決定事項・ToDo・タイムライン）
 
 を自動で作り、結果をGoogleドライブに保存します。
+**すべての処理をColabの中（無料のGPU）で行うので、料金やAPIキーは不要です。**
 
 ---
 
 ## 📋 はじめに一度だけやること
 
-1. **GPUを有効にする**：メニュー「ランタイム」→「ランタイムのタイプを変更」→「T4 GPU」を選んで保存
-2. **Claude APIキーを登録する**（要約に使います）
-   - [Anthropic Console](https://console.anthropic.com/) でAPIキーを作成
-   - 画面左の **🔑（シークレット）** アイコン → 「新しいシークレットを追加」
-   - 名前：`ANTHROPIC_API_KEY`　値：作成したキー　→「ノートブックからのアクセス」をオン
+- **GPUを有効にする**：メニュー「ランタイム」→「ランタイムのタイプを変更」→「T4 GPU」を選んで保存
 
 ## ▶️ 使い方
 
@@ -71,7 +68,7 @@ else:
     print("⚠️ GPUが見つかりません。文字起こしがとても遅くなります。")
     print("   メニュー「ランタイム」→「ランタイムのタイプを変更」→「T4 GPU」を選んでください。")
 
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "faster-whisper", "anthropic"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "faster-whisper", "transformers", "accelerate", "bitsandbytes"], check=True)
 print("✅ 準備が完了しました")
 """)
 
@@ -106,8 +103,8 @@ GLOSSARY = "" #@param {type:"string"}
 MEETING_TITLE = "" #@param {type:"string"}
 MEETING_DATE = "" #@param {type:"string"}
 PARTICIPANTS = "" #@param {type:"string"}
-#@markdown 要約に使うClaudeのモデル（Opus：最高品質 ／ Sonnet：バランス ／ Haiku：最安・高速）
-CLAUDE_MODEL = "claude-opus-5-5" #@param ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+#@markdown 要約に使うAI（Colabの中で動きます）。`Qwen3-8B`：標準 ／ `Qwen3-4B`：速いが簡素 ／ `Swallow-8B`：日本語特化
+LLM_MODEL = "Qwen3-8B" #@param ["Qwen3-8B", "Qwen3-4B", "Swallow-8B"]
 DETAIL_LEVEL = "標準" #@param ["簡潔", "標準", "詳細"]
 #@markdown 議事録への追加の指示（例：「営業部向けに、売上の話を重点的に」）
 CUSTOM_INSTRUCTIONS = "" #@param {type:"string"}
@@ -115,8 +112,8 @@ CUSTOM_INSTRUCTIONS = "" #@param {type:"string"}
 #@markdown ### ⚙️ 詳細設定（通常は変更不要）
 #@markdown 文字起こしを何分ずつ区切って保存するか
 CHUNK_MINUTES = 10 #@param {type:"integer"}
-#@markdown 要約のとき何分ずつに区切って整理するか
-BLOCK_MINUTES = 30 #@param {type:"integer"}
+#@markdown 要約のとき何文字ずつに区切って整理するか（目安：日本語の会話で約15〜20分ぶん）
+BLOCK_CHARS = 6000 #@param {type:"integer"}
 #@markdown GPUのメモリ不足エラーが出たら 4 → 2 と下げてください
 BATCH_SIZE = 8 #@param {type:"integer"}
 #@markdown ✅ にすると、このファイルの過去の結果を消して最初からやり直します
@@ -303,66 +300,77 @@ for s in segments[:10]:
 
 # ---------------------------------------------------------------------------
 code(r"""
-#@title ⑤ 議事録を作成（Claudeで要約）
-#@markdown 長い会議は30分ごとに整理してから、最後に全体の議事録にまとめます。<br>
-#@markdown 途中で止まった場合も、もう一度実行すれば終わった部分は飛ばして続きから進みます。
-import json, subprocess, hashlib
+#@title ⑤ 議事録を作成（Colabの中のAIで要約・料金はかかりません）
+#@markdown 初回はAIモデル（約16GB）のダウンロードと読み込みに5〜10分かかります。<br>
+#@markdown 目安：1時間の会議で約10〜20分。途中で止まっても、再実行すれば終わった部分は飛ばして続きから進みます。
+import json, subprocess, hashlib, gc, re, time
 from pathlib import Path
-import anthropic
-from google.colab import userdata
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
 
-# --- APIキーの読み込み ---
-try:
-    _api_key = userdata.get("ANTHROPIC_API_KEY")
-except Exception:
-    raise SystemExit("❌ APIキーが見つかりません。画面左の🔑（シークレット）に ANTHROPIC_API_KEY を登録し、"
-                     "「ノートブックからのアクセス」をオンにしてください。")
-client = anthropic.Anthropic(api_key=_api_key, max_retries=5, timeout=900)
-
-PRICES = {  # 100万トークンあたりの料金（米ドル）：入力, 出力
-    "claude-opus-5-5": (4.00, 20.00),
-    "claude-sonnet-5-5": (2.00, 10.00),
-    "claude-haiku-5-5": (0.10, 0.50),
+LLM_IDS = {
+    "Qwen3-8B": "Qwen/Qwen3-8B",
+    "Qwen3-4B": "Qwen/Qwen3-4B-Instruct-2507",
+    "Swallow-8B": "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.5",
 }
-usage_total = {"in": 0, "out": 0}
+_use_gpu = torch.cuda.is_available()
 
-def ask_claude(system, user_text, max_tokens, effort):
-    params = dict(
-        model=CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user_text}],
-        thinking={"type": "adaptive"},
-        output_config={"effort": effort},
-    )
-    try:
-        if CLAUDE_MODEL in ("claude-opus-5-5", "claude-sonnet-5-5"):
-            # 安全フィルターが誤って処理を断った場合に、別モデルで自動的にやり直す設定
-            with client.beta.messages.stream(**params, betas=["server-side-fallback-2026-07-01"],
-                                             extra_body={"fallbacks": "default"}) as stream:
-                msg = stream.get_final_message()
-        else:
-            with client.messages.stream(**params) as stream:
-                msg = stream.get_final_message()
-    except anthropic.AuthenticationError:
-        raise SystemExit("❌ APIキーが正しくありません。🔑シークレットの ANTHROPIC_API_KEY を確認してください。")
-    except anthropic.PermissionDeniedError as e:
-        raise SystemExit(f"❌ このAPIキーでは {CLAUDE_MODEL} を使えません。別のモデルを選ぶか、Consoleで設定を確認してください。\n{e}")
-    except anthropic.RateLimitError:
-        raise SystemExit("❌ 利用上限に達しました。少し時間をおいてから、もう一度このセルを実行してください（続きから再開します）。")
-    except anthropic.APIStatusError as e:
-        if e.status_code == 400 and "credit" in str(e).lower():
-            raise SystemExit("❌ APIのクレジット残高が不足しています。Anthropic Consoleでチャージしてください。")
-        raise
+# 文字起こし用のモデルを片付けて、GPUのメモリを空ける
+for _name in ("whisper_pipeline", "whisper_model", "_loaded_model_name"):
+    globals().pop(_name, None)
+gc.collect()
+if _use_gpu:
+    torch.cuda.empty_cache()
 
-    usage_total["in"] += msg.usage.input_tokens
-    usage_total["out"] += msg.usage.output_tokens
-    if msg.stop_reason == "refusal":
-        raise SystemExit("❌ Claudeがこの内容の処理を辞退しました。別のモデルを選んで再実行してください。")
-    text = "".join(b.text for b in msg.content if b.type == "text").strip()
-    if msg.stop_reason == "max_tokens":
-        text += "\n\n（※出力が長すぎたため、ここで途切れています）"
+# --- 要約用AIモデルの読み込み（同じモデルなら再利用） ---
+if globals().get("_llm_name") != LLM_MODEL:
+    globals().pop("llm", None)
+    gc.collect()
+    _repo = LLM_IDS.get(LLM_MODEL, LLM_MODEL)
+    print(f"⏳ 要約用AI（{_repo}）を読み込み中…（初回はダウンロードに数分かかります）")
+    tokenizer = AutoTokenizer.from_pretrained(_repo)
+    if _use_gpu:
+        # 4bitに圧縮して読み込み、無料GPU（T4）のメモリに収める
+        llm = AutoModelForCausalLM.from_pretrained(
+            _repo, device_map="auto",
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16))
+    else:
+        print("⚠️ GPUが無いため、とても時間がかかります（T4 GPUの利用をおすすめします）")
+        llm = AutoModelForCausalLM.from_pretrained(_repo, torch_dtype=torch.float32)
+    llm.eval()
+    _llm_name = LLM_MODEL
+    print("✅ 読み込み完了")
+
+def generate(system, user_text, max_new_tokens, show=False):
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_text}]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                           enable_thinking=False)
+    inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True) if show else None
+    with torch.inference_mode():
+        out = llm.generate(**inputs, max_new_tokens=max_new_tokens, streamer=streamer,
+                           do_sample=True, temperature=0.5, top_p=0.8, top_k=20,
+                           repetition_penalty=1.05,
+                           pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+    new_tokens = out[0][inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    if len(new_tokens) >= max_new_tokens:
+        text += "\n\n（※長くなったため、ここで途切れています）"
     return text
+
+parts_dir = JOB_DIR / "summary_parts"
+
+def cached_generate(tag, system, user_text, max_new_tokens):
+    # 文字起こし・設定・モデルが前回と同じなら、保存済みの結果を再利用する
+    key = hashlib.sha1(f"{LLM_MODEL}\n{system}\n{user_text}".encode("utf-8")).hexdigest()[:10]
+    f = parts_dir / f"{tag}_{key}.md"
+    if f.exists():
+        return f.read_text(encoding="utf-8"), True
+    text = generate(system, user_text, max_new_tokens)
+    f.write_text(text, encoding="utf-8")
+    return text, False
 
 def fmt_time(sec):
     h, rem = divmod(int(max(0, sec)), 3600)
@@ -379,124 +387,114 @@ if not segments:
 def to_text(segs):
     return "\n".join(f"[{fmt_time(s['start'])}] {s['text']}" for s in segs)
 
-# --- 時間ごとのブロックに分ける ---
-block_sec = max(5, BLOCK_MINUTES) * 60
-blocks = []
+# --- 文字数で区間に分ける ---
+blocks, _size = [], 0
 for s in segments:
-    if not blocks or s["start"] - blocks[-1][0]["start"] >= block_sec:
+    if not blocks or _size + len(s["text"]) > max(1000, BLOCK_CHARS):
         blocks.append([])
+        _size = 0
     blocks[-1].append(s)
+    _size += len(s["text"])
 
 meeting_info = "\n".join(x for x in [
     f"会議名: {MEETING_TITLE}" if MEETING_TITLE.strip() else "",
-    f"日時: {MEETING_DATE}" if MEETING_DATE.strip() else "",
     f"参加者: {PARTICIPANTS}" if PARTICIPANTS.strip() else "",
     f"専門用語・固有名詞: {GLOSSARY}" if GLOSSARY.strip() else "",
-] if x) or "（会議の情報は入力されていません）"
+] if x) or "（なし）"
 
 DETAIL = {
-    "簡潔": "要点だけを短く、箇条書き中心でまとめてください。",
-    "標準": "要点を押さえつつ、議論の経緯や理由も分かる程度の詳しさでまとめてください。",
-    "詳細": "誰が何を言ったか・数値・理由・反対意見など、できるだけ漏らさず詳しく記録してください。",
+    "簡潔": "要点だけを短く、箇条書きでまとめてください。",
+    "標準": "要点を押さえつつ、理由や経緯も分かるようにまとめてください。",
+    "詳細": "発言の内容・数値・理由・反対意見などを、できるだけ漏らさず詳しく書いてください。",
 }[DETAIL_LEVEL]
+EXTRA = f"\n追加の指示: {CUSTOM_INSTRUCTIONS.strip()}" if CUSTOM_INSTRUCTIONS.strip() else ""
 
 ASR_NOTE = (
-    "入力は音声認識（Whisper）による自動文字起こしです。次の点に注意してください。\n"
-    "- 同音異義語の誤変換や聞き間違いがあります。文脈から正しい語が明らかな場合は直して書いてください。\n"
-    "- 話者の区別はありません。話の流れから話者が明らかな場合のみ記載し、推測で人物を断定しないでください。\n"
-    "- 「えー」「あの」などのつなぎ言葉や雑談は省いてください。\n"
-    "- 文字起こしに無い内容を作り出さないでください。聞き取りが不確かな重要語には（？）を付けてください。\n"
-    "- 行頭の [時:分:秒] は録音開始からの経過時間です。"
+    "入力は音声の自動文字起こしなので、聞き間違いや誤変換があります。文脈から正しい語が明らかなら直してください。"
+    "つなぎ言葉や雑談は省き、書かれていない内容を作らないでください。[時:分:秒] は録音開始からの時刻です。"
 )
 
-BLOCK_SYSTEM = f'''あなたは優秀な議事録担当者です。長時間の会議の文字起こしの「一部区間」を読み、後で全体の議事録にまとめるための整理メモを日本語で作ります。
-
+BLOCK_SYSTEM = f'''あなたは会議の議事録担当者です。会議の文字起こしの一部を読み、日本語で整理メモを作ります。
 {ASR_NOTE}
-
-次の形式（Markdown）で出力してください。該当がない項目は「なし」と書いてください。
-
-### 話題の流れ
-- [時:分] 話題 — 要点（時刻は区間内の該当箇所）
-### 主な論点・発言
+次の見出しで、Markdownの箇条書きで出力してください。該当がなければ「なし」と書きます。
+### 話題の流れ（[時:分] 話題：要点）
+### 主な意見・発言
 ### 決定事項
-### ToDo・宿題（内容／担当／期限。分からない部分は「不明」）
-### 数値・固有名詞・重要キーワード
-### 未解決の点・確認が必要な点
+### ToDo（内容／担当／期限）
+### 未解決の点
+{DETAIL}{EXTRA}'''
 
-{DETAIL}'''
+MERGE_SYSTEM = f'''あなたは会議の議事録担当者です。会議の連続した区間の整理メモを、1つの整理メモに統合します。
+重複はまとめ、決定事項・ToDo・数値・時刻は省略せず残してください。見出しは入力と同じものを使います。{EXTRA}'''
 
-FINAL_SYSTEM = f'''あなたは優秀な議事録担当者です。会議全体の議事録を日本語のMarkdownで作成します。
-入力として、区間ごとの整理メモ（と、可能な場合は文字起こし全文）が与えられます。
-
-{ASR_NOTE}
-
-次の構成で出力してください。区間をまたいで続いた話題は1つにまとめ、重複は除いてください。
-
-# （会議名。不明なら内容から付けた仮題）議事録
-- **日時**：（不明なら「記載なし」）
-- **参加者**：（不明なら「記載なし」）
-- **録音時間**：
+FINAL_SYSTEM = f'''あなたは会議の議事録担当者です。会議全体の整理メモから、日本語の議事録本文を作ります。
+同じ話題は1つにまとめ、メモに無い内容は書かないでください。次の見出しのMarkdownで出力してください。
 
 ## 1. 会議の要約
-（会議全体を3〜7行で。何のための会議で、何が決まったか）
-
+（3〜7行。何の会議で、何が決まったか）
 ## 2. 議題ごとの議論内容
-（議題ごとに「### 見出し」を付け、結論 → 主な意見・経緯 の順に）
-
+（議題ごとに「### 見出し」を付け、結論 → 主な意見 の順に）
 ## 3. 決定事項
-## 4. ToDo（今後のアクション）
+## 4. ToDo
 | No | 内容 | 担当 | 期限 |
 |---|---|---|---|
-
 ## 5. 未決事項・次回への持ち越し
-## 6. タイムライン（主な話題と開始時刻）
-## 7. 補足（聞き取りが不確かな箇所・確認が必要な点）
+## 6. タイムライン（[時:分] 主な話題）
+{DETAIL}{EXTRA}'''
 
-{DETAIL}'''
+t_begin = time.time()
 
-if CUSTOM_INSTRUCTIONS.strip():
-    BLOCK_SYSTEM += f"\n\n追加の指示: {CUSTOM_INSTRUCTIONS.strip()}"
-    FINAL_SYSTEM += f"\n\n追加の指示: {CUSTOM_INSTRUCTIONS.strip()}"
-
-# --- ステップ1：区間ごとの整理（保存済みの区間は飛ばす） ---
-parts_dir = JOB_DIR / "summary_parts"
-part_texts = []
-print(f"📝 {len(blocks)}個の区間に分けて整理します（モデル: {CLAUDE_MODEL}）")
+# --- ステップ1：区間ごとの整理 ---
+print(f"📝 {len(blocks)}個の区間に分けて整理します")
+notes = []
 for i, blk in enumerate(blocks, 1):
-    head = f"## 区間{i}（{fmt_time(blk[0]['start'])}〜{fmt_time(blk[-1]['end'])}）"
-    user = (f"【会議の情報】\n{meeting_info}\n\n"
-            f"【区間】全{len(blocks)}区間のうち{i}番目（{head[3:]}）\n\n"
-            f"【文字起こし】\n{to_text(blk)}")
-    # 文字起こし・設定・モデルが前回と同じ区間だけ、保存済みの結果を再利用する
-    key = hashlib.sha1(f"{CLAUDE_MODEL}\n{BLOCK_SYSTEM}\n{user}".encode("utf-8")).hexdigest()[:10]
-    part_file = parts_dir / f"part_{i:03d}_{key}.md"
-    if part_file.exists():
-        print(f"   区間{i}/{len(blocks)}: 保存済みのため省略")
-    else:
-        for old in parts_dir.glob(f"part_{i:03d}*.md"):
-            old.unlink()
-        print(f"   区間{i}/{len(blocks)}: 整理中…", end="", flush=True)
-        body = ask_claude(BLOCK_SYSTEM, user, max_tokens=16000, effort="medium")
-        part_file.write_text(f"{head}\n\n{body}\n", encoding="utf-8")
-        print(" 完了")
-    part_texts.append(part_file.read_text(encoding="utf-8"))
+    span = f"{fmt_time(blk[0]['start'])}〜{fmt_time(blk[-1]['end'])}"
+    print(f"   区間{i}/{len(blocks)}（{span}）: ", end="", flush=True)
+    t0 = time.time()
+    text, cached = cached_generate(
+        f"part_{i:03d}", BLOCK_SYSTEM,
+        f"【会議の情報】\n{meeting_info}\n\n【文字起こし（{span}）】\n{to_text(blk)}",
+        max_new_tokens=1500)
+    print("保存済みのため省略" if cached else f"完了（{time.time() - t0:.0f}秒）")
+    notes.append(f"## 区間{i}（{span}）\n\n{text}")
+(JOB_DIR / "区間ごとの詳細メモ.md").write_text("\n\n".join(notes) + "\n", encoding="utf-8")
 
-for old in parts_dir.glob("part_*.md"):  # 区間数が減った場合の古いメモを片付ける
-    if int(old.name[5:8]) > len(blocks):
-        old.unlink()
+# --- ステップ2：メモが長すぎる場合は、隣り合う区間をまとめて短くする ---
+NOTES_LIMIT = 12000  # AIに一度に渡すメモの文字数の上限
+level = 0
+while len("\n\n".join(notes)) > NOTES_LIMIT and len(notes) > 1:
+    level += 1
+    groups, cur = [], []
+    for n in notes:
+        if cur and len("\n\n".join(cur + [n])) > NOTES_LIMIT:
+            groups.append(cur)
+            cur = []
+        cur.append(n)
+    groups.append(cur)
+    if len(groups) == len(notes):  # 1つずつしか入らない場合は2つずつまとめる
+        groups = [notes[j:j + 2] for j in range(0, len(notes), 2)]
+    print(f"🔗 メモが長いため、{len(notes)}件を{len(groups)}件に統合します（段階{level}）")
+    merged = []
+    for j, g in enumerate(groups, 1):
+        text, _ = cached_generate(f"merge{level}_{j:03d}", MERGE_SYSTEM, "\n\n".join(g), max_new_tokens=2500)
+        merged.append(text)
+    notes = merged
 
-# --- ステップ2：全体の議事録にまとめる ---
-print("📚 全体の議事録にまとめています…（数分かかることがあります）")
-full_text = to_text(segments)
-user = (f"【会議の情報】\n{meeting_info}\n録音時間: {fmt_time(segments[-1]['end'])}\n\n"
-        f"【区間ごとの整理メモ】\n\n" + "\n\n".join(part_texts))
-if len(full_text) <= 300_000:  # 長すぎなければ全文も渡して精度を上げる
-    user += f"\n\n【文字起こし全文（確認用）】\n{full_text}"
-minutes = ask_claude(FINAL_SYSTEM, user, max_tokens=64000, effort="high")
+# --- ステップ3：議事録の本文を作る ---
+print("📚 全体の議事録をまとめています…（文章が少しずつ表示されます）\n")
+body = generate(FINAL_SYSTEM, f"【会議の情報】\n{meeting_info}\n\n【整理メモ】\n" + "\n\n".join(notes),
+                max_new_tokens=4000, show=True)
 
+title = MEETING_TITLE.strip() or JOB_DIR.name
+header = (f"# {title} 議事録\n\n"
+          f"- **日時**：{MEETING_DATE.strip() or '記載なし'}\n"
+          f"- **参加者**：{PARTICIPANTS.strip() or '記載なし'}\n"
+          f"- **録音時間**：{fmt_time(segments[-1]['end'])}\n\n")
+minutes = header + body + ("\n\n---\n※ この議事録は音声の自動文字起こしをもとにAIが作成したものです。"
+                           "重要な内容は「区間ごとの詳細メモ.md」や「文字起こし.txt」で確認してください。\n")
 minutes_md = JOB_DIR / "議事録.md"
-minutes_md.write_text(minutes + "\n", encoding="utf-8")
-(JOB_DIR / "区間ごとの詳細メモ.md").write_text("\n\n".join(part_texts), encoding="utf-8")
+minutes_md.write_text(minutes, encoding="utf-8")
+final_notes = notes
 
 # Wordファイルも作成（pandocが使える場合）
 try:
@@ -506,37 +504,24 @@ try:
 except Exception:
     _docx = False
 
-_pin, _pout = PRICES[CLAUDE_MODEL]
-_cost = usage_total["in"] / 1e6 * _pin + usage_total["out"] / 1e6 * _pout
-print(f"\n✅ 議事録が完成しました！（今回のAPI利用料の目安: 約${_cost:.2f}）")
+print(f"\n\n✅ 議事録が完成しました！（所要時間 約{(time.time() - t_begin) / 60:.0f}分）")
 print(f"   📄 {minutes_md}")
 if _docx:
     print(f"   📄 {JOB_DIR / '議事録.docx'}（Word形式）")
 print(f"   📄 {JOB_DIR / '区間ごとの詳細メモ.md'}")
-
-from IPython.display import Markdown, display
-display(Markdown(minutes))
 """)
 
 # ---------------------------------------------------------------------------
 code(r"""
 #@title ⑥（おまけ）会議の内容について質問する
 #@markdown ⑤を実行したあとに使えます。質問を書き換えて何度でも実行できます。
-QUESTION = "〇〇さんが担当になったタスクを全部教えて" #@param {type:"string"}
+QUESTION = "決まったことと、それぞれの担当者を教えて" #@param {type:"string"}
 
-_full = to_text(segments)
-if len(_full) <= 300_000:
-    _context = f"【文字起こし全文】\n{_full}"
-else:
-    _context = "【区間ごとの整理メモ】\n" + "\n\n".join(part_texts)
-
-_answer = ask_claude(
-    "あなたは会議の内容に詳しいアシスタントです。与えられた会議の記録だけを根拠に、日本語で答えてください。"
-    "根拠となる発言の時刻 [時:分:秒] を添え、記録から分からないことは「記録からは分かりません」と答えてください。\n\n" + ASR_NOTE,
-    f"【会議の情報】\n{meeting_info}\n\n{_context}\n\n【質問】\n{QUESTION}",
-    max_tokens=16000, effort="medium")
-from IPython.display import Markdown, display
-display(Markdown(_answer))
+print(generate(
+    "あなたは会議の内容に詳しいアシスタントです。与えられた会議のメモだけを根拠に、日本語で簡潔に答えてください。"
+    "根拠となる時刻 [時:分] があれば添え、メモから分からないことは「記録からは分かりません」と答えてください。",
+    f"【会議のメモ】\n" + "\n\n".join(final_notes) + f"\n\n【質問】\n{QUESTION}",
+    max_new_tokens=1500))
 """)
 
 # ---------------------------------------------------------------------------
@@ -546,16 +531,18 @@ md(r"""
 | ファイル | 内容 |
 |---|---|
 | `議事録.md` / `議事録.docx` | 完成した議事録（要約・決定事項・ToDo・タイムライン） |
-| `区間ごとの詳細メモ.md` | 30分ごとの詳しい整理メモ |
+| `区間ごとの詳細メモ.md` | 区間（約15〜20分）ごとの詳しい整理メモ |
 | `文字起こし.txt` | 時刻付きの文字起こし全文 |
 | `字幕.srt` | 動画プレーヤーで使える字幕ファイル |
 | `chunks/`, `summary_parts/`, `transcript.json` | 途中再開用のデータ（消しても問題ありません） |
 
 ## ❓ 困ったときは
 
-- **「CUDA out of memory」と出た** → ③の `BATCH_SIZE` を 4 や 2 に下げて、④を再実行
+- **④で「CUDA out of memory」と出た** → ③の `BATCH_SIZE` を 4 や 2 に下げて、④を再実行
+- **⑤で「CUDA out of memory」と出た** → メニュー「ランタイム」→「セッションを再起動」後、①②③⑤の順に実行（④はやり直し不要）。それでもダメなら③で `Qwen3-4B` を選ぶ
 - **途中で接続が切れた** → ①②③を実行してから④（または⑤）を再実行すると続きから再開
 - **議事録の内容を変えたい** → ③の設定を変えて③→⑤を再実行（変更があった部分だけ作り直されます）
+- **議事録の出来が今ひとつ** → ⑤をもう一度実行すると、最後のまとめが別の言い回しで作り直されます。`DETAIL_LEVEL` を「詳細」にするのも効果的です
 - **固有名詞の誤りが多い** → ③の `GLOSSARY` に正しい表記を入れ、`START_OVER` に✅を付けて④から再実行
 """)
 
